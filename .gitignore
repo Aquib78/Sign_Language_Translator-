@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+*.npy
+data/
+videos/
+*.mp4
+models/model.pth
+.DS_Store
+filtered_data/
+wlasl
+models
