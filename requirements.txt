@@ -1,0 +1,9 @@
+numpy
+torch
+mediapipe
+opencv-python
+transformers
+scikit-learn
+pyttsx3
+streamlit
+datasets
