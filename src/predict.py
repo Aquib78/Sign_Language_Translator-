@@ -3,6 +3,8 @@ inference.py  -  Sign Language AI System
 Professional split-panel UI: camera left, control panel right.
 Canvas: 1280 x 720
 """
+import sys, os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import cv2
 import mediapipe as mp
@@ -176,11 +178,11 @@ class AttentionLSTM(nn.Module):
         return self.fc(self.dropout(c))
 
 
-with open("encoder.pkl", "rb") as f:
+with open("models/encoder.pkl", "rb") as f:
     encoder = pickle.load(f)
 
 model = AttentionLSTM(126, 128, len(encoder.classes_)).to(device)
-model.load_state_dict(torch.load("model.pth", map_location=device, weights_only=True))
+model.load_state_dict(torch.load("models/model.pth", map_location=device, weights_only=True))
 model.eval()
 print(f"Loaded model — {len(encoder.classes_)} classes")
 print(f"Vocabulary: {[str(c) for c in encoder.classes_]}\n")
