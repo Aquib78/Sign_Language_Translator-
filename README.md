@@ -157,6 +157,19 @@ models/
 ```
 
 ---
+## 🤗 Hugging Face Model
+
+The trained model is available on Hugging Face:
+
+👉 https://huggingface.co/your-username/sign-language-lstm
+
+You can download and use the model for inference without retraining.
+
+Includes:
+
+* Trained LSTM model (`model.pth`)
+* Label encoder (`encoder.pkl`)
+
 
 ## 📌 Notes
 
