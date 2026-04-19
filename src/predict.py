@@ -1,34 +1,21 @@
 """
 inference.py  -  Sign Language AI System
-Professional split-panel UI: camera left, control panel right.
-Canvas: 1280 x 720
+Minimal professional dark UI. Canvas: 1280 x 720
 """
-import sys, os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import cv2
-import mediapipe as mp
-import torch
-import torch.nn as nn
-import numpy as np
-import pickle
-import time
-import threading
-import math
+import cv2, mediapipe as mp, torch, torch.nn as nn
+import numpy as np, pickle, time, threading, math
+from sentence_engine import generate_sentences
+from tts_engine import speak, is_available as tts_available
 
-from src.sentence_engine import generate_sentences
-from src.tts_engine import speak, is_available as tts_available
-
-# =======================================================================
+# ═══════════════════════════════════════════════════════════════════════
 # DEVICE
-# =======================================================================
+# ═══════════════════════════════════════════════════════════════════════
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Device : {device}")
-print(f"TTS    : {'ON' if tts_available() else 'OFF (pip install pyttsx3)'}\n")
 
-# =======================================================================
+# ═══════════════════════════════════════════════════════════════════════
 # CONFIG
-# =======================================================================
+# ═══════════════════════════════════════════════════════════════════════
 CONF_HIGH            = 0.98
 CONF_MEDIUM          = 0.90
 MOTION_THRESHOLD     = 0.02
@@ -38,594 +25,498 @@ MAX_SIGN_FRAMES      = 60
 TARGET_FRAMES        = 30
 PREDICTION_COOLDOWN  = 2.0
 
-# Canvas
 CW, CH  = 1280, 720
-CAM_W   = 760
+CAM_W   = 780
 PANEL_X = CAM_W
-PANEL_W = CW - CAM_W   # 520 px
+PANEL_W = CW - CAM_W      # 500 px
 
-# =======================================================================
-# COLOUR PALETTE  (BGR)
-# =======================================================================
-BG        = ( 18,  14,  24)
-CAM_BG    = ( 10,   8,  16)
-PANEL_BG  = ( 30,  24,  44)
-CARD_BG   = ( 42,  34,  60)
-CARD_SEL  = ( 58,  46,  88)
-DIVIDER   = ( 60,  50,  80)
+# ═══════════════════════════════════════════════════════════════════════
+# DESIGN SYSTEM  (BGR — much more refined palette)
+# ═══════════════════════════════════════════════════════════════════════
+# Backgrounds
+C_BASE    = (  8,   6,  12)   # near-black
+C_SURFACE = ( 16,  13,  22)   # camera bg
+C_PANEL   = ( 20,  16,  30)   # right panel
+C_CARD    = ( 28,  22,  42)   # default card
+C_CARD_HV = ( 38,  30,  58)   # hovered/selected card
+C_CARD_HI = ( 30,  42,  30)   # selected output card (green tint)
 
-ACCENT    = ( 60, 200, 255)   # gold-yellow
-GREEN     = ( 80, 210,  90)
-CYAN_W    = (230, 215,  60)   # word display colour
-RED_S     = ( 80,  80, 200)
-WHITE     = (240, 235, 228)
-SUBTEXT   = (155, 145, 170)
-HDR_LINE  = (100,  80, 140)   # visible header separator
+# Borders
+C_BORDER  = ( 45,  36,  68)   # subtle card border
+C_BORDER_A = (100,  80, 150)  # accent border (panel edge, header)
+C_BORDER_G = ( 55,  90,  55)  # green border
 
-FONT      = cv2.FONT_HERSHEY_SIMPLEX
-FONT_B    = cv2.FONT_HERSHEY_DUPLEX
+# Text
+C_TEXT    = (225, 220, 215)   # primary text
+C_MUTED   = (120, 110, 135)   # labels / subtext
+C_DIM     = ( 70,  62,  85)   # very faint
 
-# =======================================================================
+# Accents
+C_ACCENT  = ( 80, 180, 255)   # blue-white (main accent)
+C_GOLD    = ( 50, 185, 255)   # same for words
+C_GREEN   = ( 70, 200,  90)   # confirmed
+C_AMBER   = ( 50, 150, 255)   # medium confidence
+C_RED     = ( 70,  70, 200)   # low confidence / rejected
+C_CYAN    = (200, 210,  50)   # word buffer text
+
+# ═══════════════════════════════════════════════════════════════════════
 # DRAWING PRIMITIVES
-# =======================================================================
-def fill_rect(img, x, y, w, h, color, alpha=1.0):
+# ═══════════════════════════════════════════════════════════════════════
+FONT  = cv2.FONT_HERSHEY_SIMPLEX
+FONTB = cv2.FONT_HERSHEY_DUPLEX
+
+def rect(img, x, y, w, h, col, alpha=1.0):
     if alpha >= 1.0:
-        cv2.rectangle(img, (x, y), (x+w, y+h), color, -1)
+        cv2.rectangle(img, (x,y), (x+w,y+h), col, -1)
     else:
         ov = img.copy()
-        cv2.rectangle(ov, (x, y), (x+w, y+h), color, -1)
+        cv2.rectangle(ov, (x,y), (x+w,y+h), col, -1)
         cv2.addWeighted(ov, alpha, img, 1-alpha, 0, img)
 
+def card(img, x, y, w, h, col=C_CARD, border=C_BORDER, bw=1, r=6):
+    """Sleek card with thin border and optional radius."""
+    r = min(r, w//2-1, h//2-1, 10)
+    # Fill
+    cv2.rectangle(img, (x+r,y),   (x+w-r,y+h),   col, -1)
+    cv2.rectangle(img, (x,y+r),   (x+w,y+h-r),   col, -1)
+    for cx,cy,a in [(x+r,y+r,180),(x+w-r,y+r,270),(x+r,y+h-r,90),(x+w-r,y+h-r,0)]:
+        cv2.ellipse(img,(cx,cy),(r,r),a,0,90,col,-1)
+    # Border
+    if border and bw:
+        cv2.rectangle(img, (x+r,y),   (x+w-r,y+h),   border, bw)
+        cv2.rectangle(img, (x,y+r),   (x+w,y+h-r),   border, bw)
+        for cx,cy,a in [(x+r,y+r,180),(x+w-r,y+r,270),(x+r,y+h-r,90),(x+w-r,y+h-r,0)]:
+            cv2.ellipse(img,(cx,cy),(r,r),a,0,90,border,bw)
 
-def rr(img, x, y, w, h, r, color, border_col=None, bw=1):
-    """Filled rounded rectangle with optional border."""
-    r = min(r, w//2, h//2)
-    cv2.rectangle(img, (x+r, y),   (x+w-r, y+h),   color, -1)
-    cv2.rectangle(img, (x,   y+r), (x+w,   y+h-r), color, -1)
-    for cx, cy, a in [(x+r, y+r, 180), (x+w-r, y+r, 270),
-                      (x+r, y+h-r, 90), (x+w-r, y+h-r, 0)]:
-        cv2.ellipse(img, (cx, cy), (r, r), a, 0, 90, color, -1)
-    if border_col:
-        cv2.rectangle(img, (x+r, y),   (x+w-r, y+h),   border_col, bw)
-        cv2.rectangle(img, (x,   y+r), (x+w,   y+h-r), border_col, bw)
-        for cx, cy, a in [(x+r, y+r, 180), (x+w-r, y+r, 270),
-                          (x+r, y+h-r, 90), (x+w-r, y+h-r, 0)]:
-            cv2.ellipse(img, (cx, cy), (r, r), a, 0, 90, border_col, bw)
+def txt(img, s, x, y, sc=0.56, col=C_TEXT, th=1, fn=FONT):
+    cv2.putText(img, str(s), (x,y), fn, sc, col, th, cv2.LINE_AA)
 
+def txtc(img, s, cx, y, sc=0.56, col=C_TEXT, th=1, fn=FONT):
+    (w,_),_ = cv2.getTextSize(str(s),fn,sc,th)
+    cv2.putText(img,str(s),(cx-w//2,y),fn,sc,col,th,cv2.LINE_AA)
 
-def t(img, text, x, y, sc=0.60, col=WHITE, th=1, fn=FONT):
-    cv2.putText(img, str(text), (x, y), fn, sc, col, th, cv2.LINE_AA)
+def txtr(img, s, rx, y, sc=0.56, col=C_TEXT, th=1, fn=FONT):
+    (w,_),_ = cv2.getTextSize(str(s),fn,sc,th)
+    cv2.putText(img,str(s),(rx-w,y),fn,sc,col,th,cv2.LINE_AA)
 
-
-def tc(img, text, cx, y, sc=0.60, col=WHITE, th=1, fn=FONT):
-    (tw, _), _ = cv2.getTextSize(str(text), fn, sc, th)
-    cv2.putText(img, str(text), (cx-tw//2, y), fn, sc, col, th, cv2.LINE_AA)
-
-
-def wrap(img, text, x, y, mw, sc=0.58, col=WHITE, lh=24):
-    words, line = str(text).split(), ""
+def wraptext(img, s, x, y, mw, sc=0.56, col=C_TEXT, lh=22):
+    words, line = str(s).split(), ""
     for word in words:
         test = line + word + " "
-        (tw, _), _ = cv2.getTextSize(test, FONT, sc, 1)
+        (tw,_),_ = cv2.getTextSize(test,FONT,sc,1)
         if tw > mw and line:
-            t(img, line.strip(), x, y, sc, col)
-            y += lh; line = word + " "
-        else:
-            line = test
-    if line.strip():
-        t(img, line.strip(), x, y, sc, col)
-    return y + lh
+            txt(img,line.strip(),x,y,sc,col); y+=lh; line=word+" "
+        else: line=test
+    if line.strip(): txt(img,line.strip(),x,y,sc,col)
+    return y+lh
 
+def hline(img, x, y, w, col=C_BORDER, th=1):
+    cv2.line(img,(x,y),(x+w,y),col,th)
 
-def prog_bar(img, x, y, w, h, val, mx, fg=ACCENT, bg=CARD_BG, r=4):
-    rr(img, x, y, w, h, r, bg)
-    filled = int((val/max(mx,1)) * w)
-    if filled > r*2:
-        rr(img, x, y, filled, h, r, fg)
+def vline(img, x, y, h, col=C_BORDER, th=1):
+    cv2.line(img,(x,y),(x,y+h),col,th)
 
+def dot(img, cx, cy, r, col):
+    cv2.circle(img,(cx,cy),r,col,-1)
 
-def conf_bar(img, x, y, w, h, conf):
-    rr(img, x, y, w, h, 4, CARD_BG)
-    col = GREEN if conf >= CONF_HIGH else ACCENT if conf >= CONF_MEDIUM else RED_S
-    filled = int(conf * w)
-    if filled > 8:
-        rr(img, x, y, filled, h, 4, col)
-    # threshold tick marks
-    for th in (CONF_MEDIUM, CONF_HIGH):
-        tx = x + int(th * w)
-        cv2.line(img, (tx, y-3), (tx, y+h+3), DIVIDER, 1)
+def pill(img, x, y, label, col=C_ACCENT, bg=C_CARD):
+    """Small rounded pill badge."""
+    (tw,_),_ = cv2.getTextSize(label,FONT,0.42,1)
+    pw = tw+16
+    card(img,x,y,pw,20,bg,C_BORDER,1,10)
+    txt(img,label,x+8,y+14,0.42,col)
+    return pw
 
+def section_label(img, x, y, label):
+    txt(img, label, x, y, 0.38, C_MUTED)
+    return y+16
 
-# =======================================================================
+# ═══════════════════════════════════════════════════════════════════════
 # MODEL
-# =======================================================================
-def normalize_landmarks(sequence):
-    norm_seq = []
-    for frame in sequence:
-        frame = np.array(frame).reshape(2, 21, 3)
-        new_frame = []
+# ═══════════════════════════════════════════════════════════════════════
+def norm_lm(seq):
+    out=[]
+    for frame in seq:
+        frame=np.array(frame).reshape(2,21,3); nf=[]
         for hand in frame:
-            if np.sum(hand) == 0:
-                new_frame.extend(hand.flatten()); continue
-            hand = hand - hand[0]
-            mv = np.max(np.abs(hand))
-            if mv != 0: hand = hand / mv
-            new_frame.extend(hand.flatten())
-        norm_seq.append(new_frame)
-    return np.array(norm_seq)
+            if np.sum(hand)==0: nf.extend(hand.flatten()); continue
+            hand=hand-hand[0]; mv=np.max(np.abs(hand))
+            if mv: hand/=mv
+            nf.extend(hand.flatten())
+        out.append(nf)
+    return np.array(out)
 
-
-def sample_fixed(frames, target):
-    n = len(frames)
-    if n == target: return frames
-    if n < target: return frames + [frames[-1]] * (target - n)
-    return [frames[i] for i in np.linspace(0, n-1, target, dtype=int)]
-
+def sample(frames,n):
+    k=len(frames)
+    if k==n: return frames
+    if k<n:  return frames+[frames[-1]]*(n-k)
+    return [frames[i] for i in np.linspace(0,k-1,n,dtype=int)]
 
 class AttentionLSTM(nn.Module):
-    def __init__(self, input_size, hidden_size, num_classes):
+    def __init__(self,i,h,c):
         super().__init__()
-        self.lstm    = nn.LSTM(input_size, hidden_size, num_layers=2,
-                               batch_first=True, bidirectional=True, dropout=0.3)
-        self.attn    = nn.Linear(hidden_size*2, 1)
-        self.dropout = nn.Dropout(0.4)
-        self.fc      = nn.Linear(hidden_size*2, num_classes)
+        self.lstm=nn.LSTM(i,h,2,batch_first=True,bidirectional=True,dropout=0.3)
+        self.attn=nn.Linear(h*2,1); self.drop=nn.Dropout(0.4); self.fc=nn.Linear(h*2,c)
+    def forward(self,x):
+        o,_=self.lstm(x); w=torch.softmax(self.attn(o),1)
+        return self.fc(self.drop((o*w).sum(1)))
 
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        w = torch.softmax(self.attn(out), dim=1)
-        c = torch.sum(out * w, dim=1)
-        return self.fc(self.dropout(c))
-
-
-with open("models/encoder.pkl", "rb") as f:
-    encoder = pickle.load(f)
-
-model = AttentionLSTM(126, 128, len(encoder.classes_)).to(device)
-model.load_state_dict(torch.load("models/model.pth", map_location=device, weights_only=True))
+with open("models/encoder.pkl","rb") as f: encoder=pickle.load(f)
+model=AttentionLSTM(126,128,len(encoder.classes_)).to(device)
+model.load_state_dict(torch.load("models/model.pth",map_location=device,weights_only=True))
 model.eval()
-print(f"Loaded model — {len(encoder.classes_)} classes")
-print(f"Vocabulary: {[str(c) for c in encoder.classes_]}\n")
+print(f"Model: {len(encoder.classes_)} classes | Device: {device}")
 
-# =======================================================================
-# MEDIAPIPE + CAMERA
-# =======================================================================
-mp_hands = mp.solutions.hands
-mp_draw  = mp.solutions.drawing_utils
-hands    = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.7)
+# ═══════════════════════════════════════════════════════════════════════
+# MEDIAPIPE
+# ═══════════════════════════════════════════════════════════════════════
+mp_h=mp.solutions.hands; mp_d=mp.solutions.drawing_utils
+hands=mp_h.Hands(max_num_hands=2,min_detection_confidence=0.7)
+LM =mp_d.DrawingSpec(color=C_ACCENT,  thickness=2,circle_radius=2)
+CON=mp_d.DrawingSpec(color=C_BORDER_A,thickness=1)
 
-LM_SPEC   = mp_draw.DrawingSpec(color=ACCENT,      thickness=2, circle_radius=3)
-CONN_SPEC = mp_draw.DrawingSpec(color=(80, 60, 120), thickness=1)
+cap=cv2.VideoCapture(0)
+if not cap.isOpened(): raise RuntimeError("Webcam not found.")
 
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    raise RuntimeError("Could not open webcam.")
+# ═══════════════════════════════════════════════════════════════════════
+# STATE
+# ═══════════════════════════════════════════════════════════════════════
+seq=[]; recording=False; stable=0
+prev_f=None; prev_hand=False
+last_label=""; last_time=0.0; last_conf=0.0
+words=[]; sents=[]; selected=""
+cand=""; cand_c=0.0
+retry=False; retry_t=0.0; retry_msg=""
+speaking=False; pulse=0.0; ai_load=False
 
-# =======================================================================
-# GLOBAL STATE
-# =======================================================================
-sequence         = []
-recording        = False
-stable_count     = 0
-prev_features    = None
-hand_was_present = False
+# ═══════════════════════════════════════════════════════════════════════
+# BACKGROUND AI FETCH
+# ═══════════════════════════════════════════════════════════════════════
+def _ai_bg(snap):
+    global sents,ai_load
+    ai_load=True
+    try: sents=generate_sentences(snap)
+    except Exception as e: print(f"[AI] {e}")
+    finally: ai_load=False
 
-last_pred_label  = ""
-last_pred_time   = 0.0
-last_conf        = 0.0
+def ask_ai(w): threading.Thread(target=_ai_bg,args=(list(w),),daemon=True).start()
 
-word_buffer      = []
-sentences        = []
-selected         = ""
-
-candidate_word   = ""
-candidate_conf   = 0.0
-retry_prompt     = False
-retry_timer      = 0.0
-retry_msg        = ""
-
-speaking         = False
-pulse_t          = 0.0
-
-# =======================================================================
-# CONFIDENCE HANDLER
-# =======================================================================
-def handle_prediction(label, conf):
-    global word_buffer, sentences, selected
-    global retry_prompt, retry_timer, retry_msg
-    global candidate_word, candidate_conf
-    global last_pred_label, last_pred_time, last_conf
-
-    if str(label) == "none":
-        return
-    now = time.time()
-    if label == last_pred_label and (now - last_pred_time) < PREDICTION_COOLDOWN:
-        return
-
-    last_conf = conf
-
-    if conf >= CONF_HIGH:
-        word_buffer.append(str(label))
-        last_pred_label = label; last_pred_time = now
-        candidate_word  = ""; retry_prompt = False
-        sentences = generate_sentences(word_buffer)
-        selected  = ""
-        print(f"  HIGH   [{label}] {conf:.3f}  buffer={word_buffer}")
-
-    elif conf >= CONF_MEDIUM:
-        candidate_word = str(label); candidate_conf = conf
-        retry_prompt   = False
-        print(f"  MEDIUM [{label}] {conf:.3f}")
-
+# ═══════════════════════════════════════════════════════════════════════
+# PREDICTION HANDLER
+# ═══════════════════════════════════════════════════════════════════════
+def predict(label,conf):
+    global words,sents,selected,retry,retry_t,retry_msg
+    global cand,cand_c,last_label,last_time,last_conf,ai_load
+    if str(label)=="none": return
+    now=time.time()
+    if label==last_label and now-last_time<PREDICTION_COOLDOWN: return
+    last_conf=conf
+    if conf>=CONF_HIGH:
+        words.append(str(label)); last_label=label; last_time=now
+        cand=""; retry=False; selected=""; sents=[]; ask_ai(words)
+        print(f"  HIGH [{label}] {conf:.3f}  {words}")
+    elif conf>=CONF_MEDIUM:
+        cand=str(label); cand_c=conf; retry=False
+        print(f"  MED  [{label}] {conf:.3f}")
     else:
-        retry_prompt = True; retry_timer = now
-        retry_msg    = f"Low confidence ({conf:.0%}) - sign more clearly"
-        candidate_word = ""
-        print(f"  LOW    [{label}] {conf:.3f} (rejected)")
+        retry=True; retry_t=now
+        retry_msg=f"Low confidence ({conf:.0%})  —  try again"; cand=""
+        print(f"  LOW  [{label}] {conf:.3f}")
 
-
-# =======================================================================
+# ═══════════════════════════════════════════════════════════════════════
 # RENDER: HEADER
-# =======================================================================
-def render_header(canvas, is_recording):
-    # Background strip
-    fill_rect(canvas, 0, 0, CW, 62, (22, 17, 35)) # will be overwritten below
-    cv2.rectangle(canvas, (0, 0), (CW, 62), (22, 17, 35), -1)
+# ═══════════════════════════════════════════════════════════════════════
+def draw_header(cv, is_rec):
+    rect(cv,0,0,CW,56,C_SURFACE)
+    hline(cv,0,56,CW,C_BORDER_A,1)
 
-    # Bottom border — bright enough to see
-    cv2.line(canvas, (0, 62), (CW, 62), HDR_LINE, 2)
+    # Logo mark
+    cv2.rectangle(cv,(14,14),(34,42),C_ACCENT,-1)
+    cv2.rectangle(cv,(16,16),(32,40),C_SURFACE,-1)
+    dot(cv,24,29,4,C_ACCENT)
 
-    # Logo accent dot
-    cv2.circle(canvas, (28, 31), 9, ACCENT, -1)
-    cv2.circle(canvas, (28, 31), 5, (20, 15, 30), -1)
+    # Title block
+    txt(cv,"SIGN LANGUAGE AI SYSTEM",46,24,0.65,C_TEXT,1,FONTB)
+    txt(cv,"Real-time gesture recognition  |  AI sentence generation",46,44,0.38,C_MUTED)
 
-    # Title
-    t(canvas, "SIGN LANGUAGE AI SYSTEM", 50, 24, 0.70, WHITE, 1, FONT_B)
-    t(canvas, "Real-time gesture recognition & sentence generation",
-      50, 46, 0.42, SUBTEXT)
-
-    # Status pills — right side
-    pills = [
-        (f"DEVICE: {str(device).upper()}", ACCENT),
-        (f"TTS: {'ON' if tts_available() else 'OFF'}",
-         GREEN if tts_available() else SUBTEXT),
-    ]
-    px = CW - 14
-    for label_str, col in reversed(pills):
-        (tw, _), _ = cv2.getTextSize(label_str, FONT, 0.48, 1)
-        pw = tw + 20
-        px -= pw + 10
-        rr(canvas, px, 17, pw, 28, 6, (42, 34, 60))
-        t(canvas, label_str, px+10, 36, 0.48, col)
+    # Right-side status
+    rx=CW-12
+    for label_s,col in [
+        (f"TTS {'ON' if tts_available() else 'OFF'}", C_GREEN if tts_available() else C_MUTED),
+        (str(device).upper(), C_ACCENT),
+    ]:
+        (tw,_),_=cv2.getTextSize(label_s,FONT,0.40,1)
+        pw=tw+20; rx-=pw+8
+        card(cv,rx,16,pw,24,C_CARD,C_BORDER,1,12)
+        txt(cv,label_s,rx+10,33,0.40,col)
 
     # Recording badge
-    if is_recording:
-        pulse = int(180 + 60 * math.sin(pulse_t * 8))
-        rr(canvas, 410, 17, 130, 28, 6, (40, 40, min(pulse, 220)))
-        cv2.circle(canvas, (426, 31), 5, (80, 80, 255), -1)
-        t(canvas, "RECORDING", 436, 36, 0.50, WHITE, 1)
+    if is_rec:
+        p=int(160+80*math.sin(pulse*6))
+        card(cv,rx-140,16,110,24,(30,30,min(p,220)),None,0,12)
+        dot(cv,rx-130+14,28,4,(90,90,255))
+        txt(cv,"RECORDING",rx-130+24,33,0.40,C_TEXT)
 
-
-# =======================================================================
+# ═══════════════════════════════════════════════════════════════════════
 # RENDER: CAMERA
-# =======================================================================
-def render_camera(canvas, cam_frame, is_recording, seq_len):
-    # Background
-    cv2.rectangle(canvas, (0, 63), (CAM_W, CH), CAM_BG, -1)
+# ═══════════════════════════════════════════════════════════════════════
+def draw_camera(cv, frame, is_rec, seq_n):
+    rect(cv,0,57,CAM_W,CH-57,C_SURFACE)
 
-    if cam_frame is None:
-        return
+    if frame is None: return
+    h,w=frame.shape[:2]
+    ah=CH-57-44; aw=CAM_W-16
+    sc=min(aw/w,ah/h); nw,nh=int(w*sc),int(h*sc)
+    res=cv2.resize(frame,(nw,nh))
+    ox=(CAM_W-nw)//2; oy=57+(ah-nh)//2
 
-    h, w = cam_frame.shape[:2]
-    avail_h = CH - 63 - 48
-    avail_w = CAM_W - 20
+    # Camera border
+    bc=C_ACCENT if is_rec else C_BORDER
+    bw=2 if is_rec else 1
+    cv2.rectangle(cv,(ox-bw,oy-bw),(ox+nw+bw,oy+nh+bw),bc,bw)
+    cv[oy:oy+nh,ox:ox+nw]=res
 
-    scale = min(avail_w / w, avail_h / h)
-    nw, nh = int(w*scale), int(h*scale)
-    resized = cv2.resize(cam_frame, (nw, nh))
+    # Status overlay (bottom of camera)
+    sy=oy+nh-10
+    st="Capturing gesture..." if is_rec else "Waiting for gesture..."
+    sc2=C_ACCENT if is_rec else C_MUTED
+    (sw,_),_=cv2.getTextSize(st,FONT,0.48,1)
+    rect(cv,ox,sy-18,sw+18,22,(8,6,12),0.7)
+    txt(cv,st,ox+9,sy,0.48,sc2)
 
-    ox = (CAM_W - nw) // 2
-    oy = 63 + (avail_h - nh) // 2
+    # Progress bar
+    if is_rec:
+        py=oy+nh+8
+        cv2.rectangle(cv,(ox,py),(ox+nw,py+5),C_CARD,-1)
+        fw=int(seq_n/MAX_SIGN_FRAMES*nw)
+        if fw>2: cv2.rectangle(cv,(ox,py),(ox+fw,py+5),C_ACCENT,-1)
 
-    # Border around camera — ACCENT when recording, subtle when idle
-    border_col = ACCENT if is_recording else (50, 42, 68)
-    border_w   = 3 if is_recording else 1
-    cv2.rectangle(canvas, (ox-border_w, oy-border_w),
-                  (ox+nw+border_w, oy+nh+border_w), border_col, border_w)
+# ═══════════════════════════════════════════════════════════════════════
+# RENDER: PANEL
+# ═══════════════════════════════════════════════════════════════════════
+def draw_panel(cv):
+    global retry, ai_load, pulse
 
-    canvas[oy:oy+nh, ox:ox+nw] = resized
+    px=PANEL_X; pw=PANEL_W
+    rect(cv,px,0,pw,CH,C_PANEL)
+    vline(cv,px,0,CH,C_BORDER_A,1)
 
-    # Status text over camera bottom
-    status_y = oy + nh - 12
-    if is_recording:
-        status_str = f"Capturing gesture...  {seq_len}/{MAX_SIGN_FRAMES} frames"
-        status_col = ACCENT
+    mx=px+14; mw=pw-28   # inner margins
+    y=68
+
+    # ── Detected Words ──────────────────────────────────────────────
+    y=section_label(cv,mx,y,"DETECTED WORDS")
+    card(cv,mx,y,mw,50,C_CARD,C_BORDER,1,6)
+
+    if words:
+        # Word chips
+        cx2=mx+12; cy=y+16
+        for i,w in enumerate(words):
+            (tw,_),_=cv2.getTextSize(w,FONTB,0.52,1)
+            cw2=tw+18
+            if cx2+cw2>mx+mw-10: break   # overflow guard
+            card(cv,cx2,cy,cw2,22,C_CARD_HV,C_BORDER_A,1,11)
+            txt(cv,w,cx2+9,cy+15,0.52,C_CYAN,1,FONTB)
+            if i<len(words)-1:
+                txt(cv,">",(cx2+cw2+4),cy+15,0.44,C_DIM)
+                cx2+=cw2+18
+            else:
+                cx2+=cw2+6
     else:
-        status_str = "Waiting for gesture..."
-        status_col = SUBTEXT
+        txt(cv,"No words detected yet",mx+12,y+31,0.50,C_MUTED)
 
-    # Subtle background behind text
-    (sw, _), _ = cv2.getTextSize(status_str, FONT, 0.52, 1)
-    fill_rect(canvas, ox, status_y-16, sw+16, 22, (10,8,16), 0.65)
-    t(canvas, status_str, ox+8, status_y, 0.52, status_col)
+    y+=60; hline(cv,mx,y,mw,C_BORDER)
 
-    # Progress bar below camera
-    if is_recording:
-        pb_y = oy + nh + 10
-        prog_bar(canvas, ox, pb_y, nw, 8, seq_len, MAX_SIGN_FRAMES,
-                 fg=ACCENT, bg=(38,30,55))
+    # ── Confidence ─────────────────────────────────────────────────
+    y+=10
+    y=section_label(cv,mx,y,"LAST CONFIDENCE")
+    card(cv,mx,y,mw,48,C_CARD,C_BORDER,1,6)
 
+    bx=mx+12; by=y+14; bw2=mw-24; bh=8
+    # Track background
+    cv2.rectangle(cv,(bx,by),(bx+bw2,by+bh),C_DIM,-1)
+    # Filled portion
+    col=C_GREEN if last_conf>=CONF_HIGH else C_AMBER if last_conf>=CONF_MEDIUM else C_RED
+    fw=int(last_conf*bw2)
+    if fw>4: cv2.rectangle(cv,(bx,by),(bx+fw,by+bh),col,-1)
+    # Threshold markers
+    for th,(tc2) in [(CONF_MEDIUM,C_MUTED),(CONF_HIGH,C_MUTED)]:
+        mx2=bx+int(th*bw2)
+        cv2.line(cv,(mx2,by-3),(mx2,by+bh+3),C_DIM,1)
+    # Labels
+    txt(cv,"LOW",  bx,          by+24,0.34,C_DIM)
+    txt(cv,"0.90", bx+int(0.88*bw2)-14,by+24,0.34,C_DIM)
+    txt(cv,"0.98", bx+int(0.96*bw2)-14,by+24,0.34,C_DIM)
+    cs=f"{last_conf:.1%}" if last_conf>0 else "- -"
+    txtr(cv,cs,bx+bw2,by-2,0.54,col)
 
-# =======================================================================
-# RENDER: RIGHT PANEL
-# =======================================================================
-def render_panel(canvas):
-    # FIX: declare all globals that this function reads OR writes
-    global retry_prompt
+    y+=64; hline(cv,mx,y,mw,C_BORDER)
 
-    px = PANEL_X + 12
-    pw = PANEL_W - 24
-    y  = 74
-
-    # Panel background
-    cv2.rectangle(canvas, (PANEL_X, 0), (CW, CH), PANEL_BG, -1)
-    cv2.line(canvas, (PANEL_X, 0), (PANEL_X, CH), HDR_LINE, 2)
-
-    # ── Detected Words ─────────────────────────────────────────────
-    t(canvas, "DETECTED WORDS", px, y, 0.43, SUBTEXT)
-    y += 14
-
-    rr(canvas, px, y, pw, 52, 8, CARD_BG)
-    if word_buffer:
-        ws = "  >  ".join(word_buffer)
-        if len(ws) > 30: ws = "..." + ws[-27:]
-        t(canvas, ws, px+14, y+34, 0.75, CYAN_W, 2, FONT_B)
-        t(canvas, "u = undo", px+pw-75, y+34, 0.40, SUBTEXT)
+    # ── Banner (candidate / retry) ──────────────────────────────────
+    y+=10
+    if cand:
+        card(cv,mx,y,mw,44,(22,44,62),(50,90,130),1,6)
+        txt(cv,f"CANDIDATE  [{cand.upper()}]  {cand_c:.0%}",mx+12,y+18,0.50,C_CYAN)
+        txt(cv,"Press  'a'  to accept",mx+12,y+34,0.40,C_MUTED)
+        y+=54
+    elif retry and (time.time()-retry_t)<2.5:
+        card(cv,mx,y,mw,36,(25,25,72),(70,70,180),1,6)
+        txt(cv,retry_msg,mx+12,y+22,0.46,(140,140,230))
+        y+=46
     else:
-        t(canvas, "No words detected yet", px+14, y+33, 0.55, SUBTEXT)
-    y += 66
+        if retry: retry=False
+        y+=4
 
-    # ── Confidence ────────────────────────────────────────────────
-    t(canvas, "LAST CONFIDENCE", px, y, 0.43, SUBTEXT)
-    y += 14
+    # ── Sentences ──────────────────────────────────────────────────
+    hline(cv,mx,y,mw,C_BORDER); y+=10
+    y=section_label(cv,mx,y,"SENTENCE SUGGESTIONS")
 
-    rr(canvas, px, y, pw, 54, 8, CARD_BG)
+    if ai_load:
+        card(cv,mx,y,mw,46,(18,18,36),(80,60,120),1,6)
+        dots="."*(int(pulse*4)%4)
+        txt(cv,f"Generating sentences{dots}",mx+12,y+18,0.50,C_MUTED)
+        txt(cv,"AI is processing your words...",mx+12,y+34,0.40,C_DIM)
+        y+=56
+    elif sents:
+        for i,s in enumerate(sents[:3]):
+            is_sel=(selected==s)
+            bg=C_CARD_HV if is_sel else C_CARD
+            bd=C_ACCENT   if is_sel else C_BORDER
+            bw3=2         if is_sel else 1
+            ch=54
+            card(cv,mx,y,mw,ch,bg,bd,bw3,6)
 
-    bar_x = px+14; bar_y = y+14; bar_w = pw-28; bar_h = 12
-    conf_bar(canvas, bar_x, bar_y, bar_w, bar_h, last_conf)
+            # Number badge (minimal — just a small circle)
+            nc=(C_ACCENT if is_sel else C_BORDER_A)
+            dot(cv,mx+18,y+ch//2,10,nc)
+            txtc(cv,str(i+1),mx+18,y+ch//2+5,0.44,C_BASE if is_sel else C_TEXT,1,FONTB)
 
-    # Labels below bar
-    t(canvas, "LOW",  bar_x,                         bar_y+28, 0.38, SUBTEXT)
-    t(canvas, "0.90", bar_x+int(0.87*bar_w)-10,      bar_y+28, 0.38, SUBTEXT)
-    t(canvas, "0.98", bar_x+int(0.96*bar_w)-10,      bar_y+28, 0.38, SUBTEXT)
+            # Sentence
+            tc3=C_TEXT if is_sel else (180,175,190)
+            wraptext(cv,s,mx+36,y+18,mw-48,0.55,tc3,20)
 
-    # Percentage value — safe ASCII only (no em-dash)
-    conf_str = f"{last_conf:.1%}" if last_conf > 0 else "- -"
-    conf_col = GREEN if last_conf >= CONF_HIGH else \
-               ACCENT if last_conf >= CONF_MEDIUM else SUBTEXT
-    t(canvas, conf_str, bar_x+bar_w-40, bar_y-2, 0.60, conf_col, 1)
-
-    y += 70
-
-    # ── Candidate banner ──────────────────────────────────────────
-    if candidate_word:
-        rr(canvas, px, y, pw, 48, 8, (28, 55, 75), border_col=(50,100,140), bw=1)
-        t(canvas, f"CANDIDATE: {candidate_word.upper()}  ({candidate_conf:.0%})",
-          px+14, y+20, 0.58, CYAN_W)
-        t(canvas, "Press  'a'  to accept", px+14, y+38, 0.44, SUBTEXT)
-        y += 64
-
-    # ── Retry banner ──────────────────────────────────────────────
-    elif retry_prompt:
-        if (time.time() - retry_timer) < 2.5:
-            rr(canvas, px, y, pw, 40, 8, (28, 28, 80), border_col=(80,80,180), bw=1)
-            t(canvas, retry_msg, px+14, y+26, 0.48, (130, 130, 230))
-            y += 56
-        else:
-            retry_prompt = False   # auto-dismiss (safe: global declared above)
-            y += 4
+            y+=ch+6
     else:
-        y += 4
+        card(cv,mx,y,mw,46,C_CARD,C_BORDER,1,6)
+        txt(cv,"Sign gestures to generate suggestions.",mx+12,y+20,0.47,C_MUTED)
+        txt(cv,"Words will appear above as you sign.",  mx+12,y+36,0.42,C_DIM)
+        y+=56
 
-    # ── Sentence Suggestions ──────────────────────────────────────
-    t(canvas, "SENTENCE SUGGESTIONS", px, y, 0.43, SUBTEXT)
-    y += 14
-
-    if sentences:
-        for i, sent in enumerate(sentences[:3]):
-            is_sel  = (selected == sent)
-            bg_col  = CARD_SEL if is_sel else CARD_BG
-            bdr_col = ACCENT   if is_sel else None
-            bdr_w   = 2        if is_sel else 1
-
-            card_h = 58
-            rr(canvas, px, y, pw, card_h, 8, bg_col,
-               border_col=bdr_col, bw=bdr_w)
-
-            # Key badge
-            badge_col = ACCENT if is_sel else (68, 56, 95)
-            rr(canvas, px+8, y+15, 28, 28, 6, badge_col)
-            tc(canvas, str(i+1), px+22, y+34, 0.56, WHITE, 1, FONT_B)
-
-            # Sentence text
-            wrap(canvas, sent, px+46, y+26, pw-60, 0.59,
-                 WHITE if is_sel else (205, 198, 220), lh=22)
-
-            y += card_h + 8
-    else:
-        rr(canvas, px, y, pw, 54, 8, CARD_BG)
-        t(canvas, "Sign gestures to generate", px+14, y+22, 0.53, SUBTEXT)
-        t(canvas, "sentence suggestions.", px+14, y+40, 0.53, SUBTEXT)
-        y += 62
-
-    # ── Selected Output ───────────────────────────────────────────
+    # ── Selected Output ─────────────────────────────────────────────
     if selected:
-        sel_y = CH - 110
-        cv2.line(canvas, (px, sel_y-6), (px+pw, sel_y-6), DIVIDER, 1)
-        t(canvas, "SELECTED OUTPUT", px, sel_y, 0.43, SUBTEXT)
-        sel_y += 14
-        rr(canvas, px, sel_y, pw, 62, 8, (30, 52, 30),
-           border_col=GREEN, bw=1)
-        wrap(canvas, f'"{selected}"', px+14, sel_y+22, pw-28,
-             0.60, GREEN, lh=22)
+        oy2=CH-88
+        hline(cv,mx,oy2-6,mw,C_BORDER)
+        oy2=section_label(cv,mx,oy2,  "SELECTED OUTPUT")
+        card(cv,mx,oy2,mw,54,C_CARD_HI,C_BORDER_G,1,6)
+        wraptext(cv,f'"{selected}"',mx+12,oy2+16,mw-24,0.56,C_GREEN,20)
         if speaking:
-            t(canvas, "Speaking...", px+pw-100, sel_y+52, 0.42, CYAN_W)
+            txt(cv,"Speaking...",mx+mw-90,oy2+44,0.38,C_MUTED)
 
-
-# =======================================================================
+# ═══════════════════════════════════════════════════════════════════════
 # RENDER: FOOTER
-# =======================================================================
-def render_footer(canvas):
-    fy = CH - 40
-    cv2.rectangle(canvas, (0, fy), (CW, CH), (14, 10, 22), -1)
-    cv2.line(canvas, (0, fy), (CAM_W, fy), HDR_LINE, 1)
+# ═══════════════════════════════════════════════════════════════════════
+def draw_footer(cv):
+    fy=CH-36
+    rect(cv,0,fy,CW,36,C_SURFACE)
+    hline(cv,0,fy,CAM_W,C_BORDER_A)
 
-    keys = [
-        ("1 / 2 / 3", "select sentence"),
-        ("a", "accept candidate"),
-        ("u", "undo word"),
-        ("c", "clear all"),
-        ("s", "speak selected"),
-        ("ESC", "quit"),
-    ]
-    kx = 18
-    for k, v in keys:
-        (kw, _), _ = cv2.getTextSize(k, FONT_B, 0.45, 1)
-        rr(canvas, kx, fy+8, kw+14, 24, 4, CARD_BG)
-        t(canvas, k, kx+7, fy+25, 0.45, ACCENT, 1, FONT_B)
-        kx += kw + 20
-        t(canvas, v, kx-6, fy+25, 0.43, SUBTEXT)
-        (vw, _), _ = cv2.getTextSize(v, FONT, 0.43, 1)
-        kx += vw + 16
-        cv2.line(canvas, (kx-6, fy+10), (kx-6, fy+32), DIVIDER, 1)
+    keys=[("1/2/3","select"),("a","accept"),("u","undo"),
+          ("c","clear"),("s","speak"),("ESC","quit")]
+    kx=16
+    for k,v in keys:
+        (kw,_),_=cv2.getTextSize(k,FONTB,0.42,1)
+        card(cv,kx,fy+8,kw+14,20,C_CARD_HV,C_BORDER,1,10)
+        txt(cv,k,kx+7,fy+22,0.42,C_ACCENT,1,FONTB)
+        kx+=kw+20
+        txt(cv,v,kx-6,fy+22,0.40,C_MUTED)
+        (vw,_),_=cv2.getTextSize(v,FONT,0.40,1)
+        kx+=vw+14
+        vline(cv,kx-6,fy+10,16,C_DIM)
 
-
-# =======================================================================
-# WINDOW SETUP
-# =======================================================================
-WIN = "Sign Language AI System"
-cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
-cv2.resizeWindow(WIN, CW, CH)
-
-print("Ready — sign gestures and press 1/2/3 to select a sentence.\n")
-
-# =======================================================================
+# ═══════════════════════════════════════════════════════════════════════
 # MAIN LOOP
-# =======================================================================
+# ═══════════════════════════════════════════════════════════════════════
+WIN="Sign Language AI System"
+cv2.namedWindow(WIN,cv2.WINDOW_NORMAL)
+cv2.resizeWindow(WIN,CW,CH)
+print("Ready.\n")
+
 while True:
-    ret, frame = cap.read()
-    if not ret:
-        continue
+    ret,frame=cap.read()
+    if not ret: continue
+    frame=cv2.flip(frame,1)
 
-    frame = cv2.flip(frame, 1)
+    rgb=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
+    rgb.flags.writeable=False; res=hands.process(rgb); rgb.flags.writeable=True
 
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    rgb.flags.writeable = False
-    results = hands.process(rgb)
-    rgb.flags.writeable = True
+    lf=[0.]*63; rf=[0.]*63; hp=False
+    if res.multi_hand_landmarks and res.multi_handedness:
+        hp=True
+        for hl,hd in zip(res.multi_hand_landmarks,res.multi_handedness):
+            flat=[v for lm in hl.landmark for v in (lm.x,lm.y,lm.z)]
+            if hd.classification[0].label=="Left": lf=flat
+            else: rf=flat
+            mp_d.draw_landmarks(frame,hl,mp_h.HAND_CONNECTIONS,LM,CON)
+    feat=lf+rf
 
-    # ── Landmark extraction ───────────────────────────────────────
-    left_lm = [0.0]*63; right_lm = [0.0]*63
-    hand_present = False
+    motion=0.
+    if hp and prev_f is not None and prev_hand:
+        motion=float(np.mean(np.abs(np.array(feat)-np.array(prev_f))))
 
-    if results.multi_hand_landmarks and results.multi_handedness:
-        hand_present = True
-        for hl, hd in zip(results.multi_hand_landmarks, results.multi_handedness):
-            lm_flat = [v for lm in hl.landmark for v in (lm.x, lm.y, lm.z)]
-            if hd.classification[0].label == "Left": left_lm = lm_flat
-            else: right_lm = lm_flat
-            mp_draw.draw_landmarks(frame, hl, mp_hands.HAND_CONNECTIONS,
-                                   LM_SPEC, CONN_SPEC)
-
-    features = left_lm + right_lm
-
-    # ── Motion detection ──────────────────────────────────────────
-    motion = 0.0
-    if hand_present and prev_features is not None and hand_was_present:
-        motion = float(np.mean(np.abs(np.array(features) - np.array(prev_features))))
-
-    if hand_present:
-        if motion > MOTION_THRESHOLD:
+    if hp:
+        if motion>MOTION_THRESHOLD:
             if not recording: print("Recording...")
-            recording = True; stable_count = 0
-        elif recording:
-            stable_count += 1
-    elif recording:
-        stable_count += 1
+            recording=True; stable=0
+        elif recording: stable+=1
+    elif recording: stable+=1
 
     if recording:
-        sequence.append(features)
-        if len(sequence) > MAX_SIGN_FRAMES:
-            sequence = sequence[-MAX_SIGN_FRAMES:]
-        pulse_t += 0.05
+        seq.append(feat)
+        if len(seq)>MAX_SIGN_FRAMES: seq=seq[-MAX_SIGN_FRAMES:]
+        pulse+=0.05
 
-    # ── Predict on stable end-of-sign ────────────────────────────
-    if recording and stable_count >= STABLE_FRAMES_NEEDED:
-        if len(sequence) >= MIN_SIGN_FRAMES:
-            sam = sample_fixed(sequence, TARGET_FRAMES)
-            sq  = normalize_landmarks(sam)
-            xt  = torch.tensor(sq, dtype=torch.float32).unsqueeze(0).to(device)
+    if recording and stable>=STABLE_FRAMES_NEEDED:
+        if len(seq)>=MIN_SIGN_FRAMES:
+            sm=sample(seq,TARGET_FRAMES); sq=norm_lm(sm)
+            xt=torch.tensor(sq,dtype=torch.float32).unsqueeze(0).to(device)
             with torch.no_grad():
-                out   = model(xt)
-                probs = torch.softmax(out, dim=1)
-                conf  = torch.max(probs).item()
-                pred  = torch.argmax(probs).item()
-            handle_prediction(encoder.inverse_transform([pred])[0], conf)
-        else:
-            print(f"  Too short ({len(sequence)}) - ignored.")
-        sequence = []; recording = False; stable_count = 0
+                out=model(xt); pr=torch.softmax(out,1)
+                cf=torch.max(pr).item(); pd=torch.argmax(pr).item()
+            predict(encoder.inverse_transform([pd])[0],cf)
+        else: print(f"  Short ({len(seq)}) ignored.")
+        seq=[]; recording=False; stable=0
 
-    prev_features    = features if hand_present else None
-    hand_was_present = hand_present
+    prev_f=feat if hp else None; prev_hand=hp
 
-    # ── Compose canvas ────────────────────────────────────────────
-    canvas = np.zeros((CH, CW, 3), dtype=np.uint8)
-    canvas[:] = BG
+    # Compose
+    canvas=np.zeros((CH,CW,3),dtype=np.uint8)
+    canvas[:]=C_BASE
+    draw_header(canvas,recording)
+    draw_camera(canvas,frame,recording,len(seq))
+    draw_panel(canvas)
+    draw_footer(canvas)
+    cv2.imshow(WIN,canvas)
 
-    render_header(canvas, recording)
-    render_camera(canvas, frame, recording, len(sequence))
-    render_panel(canvas)
-    render_footer(canvas)
-
-    cv2.imshow(WIN, canvas)
-
-    # ── Key handling ──────────────────────────────────────────────
-    key = cv2.waitKey(1) & 0xFF
-
-    if key == 27:
-        break
-    elif key in (ord('1'), ord('2'), ord('3')):
-        idx = key - ord('1')
-        if idx < len(sentences):
-            selected = sentences[idx]
-            print(f"Selected: {selected}")
-    elif key == ord('s') and selected and not speaking:
-        def _bg(text):
-            global speaking
-            speaking = True; speak(text); speaking = False
-        threading.Thread(target=_bg, args=(selected,), daemon=True).start()
-    elif key == ord('a') and candidate_word:
-        word_buffer.append(candidate_word)
-        last_pred_label = candidate_word
-        last_pred_time  = time.time()
-        sentences = generate_sentences(word_buffer)
-        selected  = ""
-        print(f"  Accepted [{candidate_word}]  buffer={word_buffer}")
-        candidate_word = ""; candidate_conf = 0.0
-    elif key == ord('u') and word_buffer:
-        r = word_buffer.pop()
-        sentences = generate_sentences(word_buffer) if word_buffer else []
-        selected  = ""
-        print(f"  Undo [{r}]  buffer={word_buffer}")
-    elif key == ord('c'):
-        word_buffer = []; sentences = []; selected = ""
-        candidate_word = ""; candidate_conf = 0.0
-        retry_prompt = False; last_pred_label = ""; last_conf = 0.0
+    key=cv2.waitKey(1)&0xFF
+    if key==27: break
+    elif key in (ord('1'),ord('2'),ord('3')):
+        i=key-ord('1')
+        if i<len(sents): selected=sents[i]; print(f"Selected: {selected}")
+    elif key==ord('s') and selected and not speaking:
+        def _sp(t):
+            global speaking; speaking=True; speak(t); speaking=False
+        threading.Thread(target=_sp,args=(selected,),daemon=True).start()
+    elif key==ord('a') and cand:
+        words.append(cand); last_label=cand; last_time=time.time()
+        selected=""; sents=[]; ask_ai(words)
+        print(f"  Accepted [{cand}]"); cand=""; cand_c=0.
+    elif key==ord('u') and words:
+        r=words.pop(); selected=""; sents=[]
+        if words: ask_ai(words)
+        print(f"  Undo [{r}]")
+    elif key==ord('c'):
+        words=[]; sents=[]; selected=""; cand=""; cand_c=0.
+        retry=False; last_label=""; last_conf=0.; pulse=0.
         print("  Cleared.")
 
-# =======================================================================
-# CLEANUP
-# =======================================================================
-cap.release()
-cv2.destroyAllWindows()
-hands.close()
+cap.release(); cv2.destroyAllWindows(); hands.close()
